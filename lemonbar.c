@@ -28,6 +28,11 @@
 #define min(a,b) ((a) < (b) ? (a) : (b))
 #define indexof(c,s) (strchr((s),(c))-(s))
 
+typedef struct str_size {
+    size_t size;
+    char* str;
+} str_size;
+
 typedef struct font_t {
     xcb_font_t ptr;
     xcb_charinfo_t *width_lut;
@@ -1438,15 +1443,13 @@ sighandle (int signal)
 int
 main (int argc, char **argv)
 {
-    struct pollfd pollin[2] = {
-        { .fd = STDIN_FILENO, .events = POLLIN },
-        { .fd = -1          , .events = POLLIN },
-    };
+    struct pollfd* pollin;
+    FILE** flist;
     xcb_generic_event_t *ev;
     xcb_expose_event_t *expose_ev;
     xcb_button_press_event_t *press_ev;
-    char input[4096] = {0, };
-    bool permanent = false;
+    str_size* buffer;
+    str_size input = {200, malloc(200*sizeof(char))};
     int geom_v[4] = { -1, -1, 0, 0 };
     int ch, areas;
     char *wm_name;
@@ -1476,14 +1479,13 @@ main (int argc, char **argv)
         switch (ch) {
             case 'h':
                 printf ("lemonbar version %s patched with XFT support\n", VERSION);
-                printf ("usage: %s [-h | -g | -b | -d | -f | -a | -p | -n | -u | -B | -F]\n"
+                printf ("usage: %s [-h | -g | -b | -d | -f | -a | -p | -n | -u | -B | -F] script1 script2 ...\n"
                         "\t-h Show this help\n"
                         "\t-g Set the bar geometry {width}x{height}+{xoffset}+{yoffset}\n"
                         "\t-b Put the bar at the bottom of the screen\n"
                         "\t-d Force docking (use this if your WM isn't EWMH compliant)\n"
                         "\t-f Set the font name to use\n"
                         "\t-a Number of clickable areas available (default is 10)\n"
-                        "\t-p Don't close after the data ends\n"
                         "\t-n Set the WM_NAME atom to the specified value for this bar\n"
                         "\t-u Set the underline/overline height in pixels\n"
                         "\t-B Set background color in #AARRGGBB\n"
@@ -1491,7 +1493,6 @@ main (int argc, char **argv)
                         "\t-o Add a vertical offset to the text, it can be negative\n", argv[0]);
                 exit (EXIT_SUCCESS);
             case 'g': (void)parse_geometry_string(optarg, geom_v); break;
-            case 'p': permanent = true; break;
             case 'n': wm_name = strdup(optarg); break;
             case 'b': topbar = false; break;
             case 'd': dock = true; break;
@@ -1503,6 +1504,25 @@ main (int argc, char **argv)
             case 'U': dugc = ugc = parse_color(optarg, NULL, fgc); break;
             case 'a': areas = strtoul(optarg, NULL, 10); break;
         }
+    }
+    
+    // remove options from array 
+    argc -= optind;
+    argv += optind;
+    
+    // Malloc arrays
+    pollin = malloc((argc + 1) * sizeof(struct pollfd)); // Use argc + 1 to accomadate for x server connection
+    flist = malloc(argc*sizeof(FILE*));
+    buffer = malloc(argc*sizeof(str_size));
+
+    // Start bar modules
+    for (int i=0; i<argc; i++) {
+        flist[i] = popen(argv[i], "r");
+        pollin[i+1].fd = fileno(flist[i]);
+        pollin[i+1].events = POLLIN;
+
+        buffer[i].size = 1;
+        buffer[i].str = malloc(1);
     }
 
     // Initialize the stack holding the clickable areas
@@ -1533,7 +1553,7 @@ main (int argc, char **argv)
     // The string is strdup'd when stripping argv[0]
     free(instance_name);
     // Get the fd to Xserver
-    pollin[1].fd = xcb_get_file_descriptor(c);
+    pollin[0].fd = xcb_get_file_descriptor(c);
 
     // Prevent fgets to block
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
@@ -1545,19 +1565,8 @@ main (int argc, char **argv)
         if (xcb_connection_has_error(c))
             break;
 
-        if (poll(pollin, 2, -1) > 0) {
-            if (pollin[0].revents & POLLHUP) {      // No more data...
-                if (permanent) pollin[0].fd = -1;   // ...null the fd and continue polling :D
-                else break;                         // ...bail out
-            }
-            if (pollin[0].revents & POLLIN) { // New input, process it
-                input[0] = '\0';
-                while (fgets(input, sizeof(input), stdin) != NULL)
-                    ; // Drain the buffer, the last line is actually used
-                parse(input);
-                redraw = true;
-            }
-            if (pollin[1].revents & POLLIN) { // The event comes from the Xorg server
+        if (poll(pollin, argc+1, -1) > 0) {
+            if (pollin[0].revents & POLLIN) { // The event comes from the Xorg server
                 while ((ev = xcb_poll_for_event(c))) {
                     expose_ev = (xcb_expose_event_t *)ev;
 
@@ -1582,9 +1591,39 @@ main (int argc, char **argv)
                     free(ev);
                 }
             }
+            for (int i=1; i<argc+1; i++) {
+                // Remove closed proecceses
+                if (pollin[i].revents & POLLHUP) {
+                    pclose(flist[i-1]);
+                    pollin[i].fd = -1;
+                    pollin[i].events = 0;
+                }
+                // Check for new input
+                else if (pollin[i].revents & POLLIN) {
+                    getline(&buffer[i-1].str, &buffer[i-1].size, flist[i-1]);
+                    buffer[i-1].str[strlen(buffer[i-1].str)-1] = '\0';
+                    redraw = true;
+
+               }
+            }
         }
 
         if (redraw) { // Copy our temporary pixmap onto the window
+            int size = 0;
+            for (int i=0; i<argc; i++) {
+                size += buffer[i].size;
+            }
+            if (size > input.size) {
+                input.str = realloc(input.str, size);
+            }
+            
+            input.str[0] = '\0';
+            for (int i=0; i<argc; i++) {
+                strcat(input.str, buffer[i].str);
+            }
+            parse(input.str);
+
+
             for (monitor_t *mon = monhead; mon; mon = mon->next) {
                 xcb_copy_area(c, mon->pixmap, mon->window, gc[GC_DRAW], 0, 0, 0, 0, mon->width, bh);
             }
